@@ -9,6 +9,7 @@ import (
 
 	"github.com/smartcontractkit/chainlink-common/pkg/capabilities"
 	commoncap "github.com/smartcontractkit/chainlink-common/pkg/capabilities"
+	"github.com/smartcontractkit/chainlink-common/pkg/services"
 	"github.com/smartcontractkit/chainlink/v2/core/capabilities/remote/target/request"
 	"github.com/smartcontractkit/chainlink/v2/core/capabilities/remote/types"
 	"github.com/smartcontractkit/chainlink/v2/core/logger"
@@ -30,36 +31,25 @@ type client struct {
 
 	messageIDToCallerRequest map[string]*request.ClientRequest
 	mutex                    sync.Mutex
+	stopCh                   services.StopChan
+	wg                       sync.WaitGroup
 }
 
 var _ commoncap.TargetCapability = &client{}
 var _ types.Receiver = &client{}
+var _ services.Service = &client{}
 
 func NewClient(ctx context.Context, lggr logger.Logger, remoteCapabilityInfo commoncap.CapabilityInfo, localDonInfo capabilities.DON, dispatcher types.Dispatcher,
 	requestTimeout time.Duration) *client {
-	c := &client{
+	return &client{
 		lggr:                     lggr,
 		remoteCapabilityInfo:     remoteCapabilityInfo,
 		localDONInfo:             localDonInfo,
 		dispatcher:               dispatcher,
 		requestTimeout:           requestTimeout,
 		messageIDToCallerRequest: make(map[string]*request.ClientRequest),
+		stopCh:                   make(services.StopChan),
 	}
-
-	go func() {
-		ticker := time.NewTicker(requestTimeout)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				c.expireRequests()
-			}
-		}
-	}()
-
-	return c
 }
 
 func (c *client) expireRequests() {
@@ -72,6 +62,32 @@ func (c *client) expireRequests() {
 			delete(c.messageIDToCallerRequest, messageID)
 		}
 	}
+}
+
+func (c *client) Start(ctx context.Context) error {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		ticker := time.NewTicker(c.requestTimeout)
+		defer ticker.Stop()
+		c.lggr.Info("TargetClient started")
+		for {
+			select {
+			case <-c.stopCh:
+				return
+			case <-ticker.C:
+				c.expireRequests()
+			}
+		}
+	}()
+	return nil
+}
+
+func (c *client) Close() error {
+	close(c.stopCh)
+	c.wg.Wait()
+	c.lggr.Info("TargetClient closed")
+	return nil
 }
 
 func (c *client) Info(ctx context.Context) (commoncap.CapabilityInfo, error) {
@@ -101,7 +117,8 @@ func (c *client) Execute(ctx context.Context, capReq commoncap.CapabilityRequest
 		return nil, fmt.Errorf("request for message ID %s already exists", messageID)
 	}
 
-	req, err := request.NewClientRequest(ctx, c.lggr, capReq, messageID, c.remoteCapabilityInfo, c.localDONInfo, c.dispatcher,
+	cCtx, _ := c.stopCh.NewCtx()
+	req, err := request.NewClientRequest(cCtx, c.lggr, capReq, messageID, c.remoteCapabilityInfo, c.localDONInfo, c.dispatcher,
 		c.requestTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create client request: %w", err)
@@ -139,4 +156,16 @@ func GetMessageIDForRequest(req commoncap.CapabilityRequest) (string, error) {
 	}
 
 	return req.Metadata.WorkflowID + req.Metadata.WorkflowExecutionID, nil
+}
+
+func (c *client) Ready() error {
+	return nil
+}
+
+func (c *client) HealthReport() map[string]error {
+	return nil
+}
+
+func (c *client) Name() string {
+	return "TargetClient"
 }
